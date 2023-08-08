@@ -74,10 +74,6 @@ def failover(rec_res_group_name,app_service_name,web_client,resource_client,clie
                 "database_name_pri" : database_name,
                 "link_id"  : database_link_id
             }
-                store_json_in_existing_container(source, "payload", rec_id, "DefaultEndpointsProtocol=https;AccountName=recoveryresourcepayload;AccountKey=t8dJ961d0c/2Y+Hwv+/UYnNyZEzKq2U7zaEuJDQPxu5MSLkX1ldJ6OAtexk8hRZbydqlELsbO99h+AStH3s4/Q==;EndpointSuffix=core.windows.net")
-                logging.info("failover to completed to server %s",replica_server)
-                connection_string = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=tcp:"+replica_server_rg+".database.windows.net,1433;DATABASE=main-east-us-db;UID=sqluser;PWD=Apnx#1122"
-                update_conn_string("CONNECTION_STRING", connection_string)
     for i in server_list:
         database_a=client.databases.list_by_server(resource_group_name,i)
         for j in database_a:
