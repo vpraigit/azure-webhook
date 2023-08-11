@@ -143,6 +143,7 @@ def HttpTrigger(req: func.HttpRequest) -> func.HttpResponse:
 
                                         cmd = f'Set-Content -Path "{file_path}" -Value @"\n{file_contents}\n"@'
                                         session.run_ps(cmd)
+                                        
                                         cmd = f'Restart-WebAppPool -Name "APPRANIX_myclouditecplatformapi.ciodev.accenture.com"'
                                         session.run_ps(cmd)
 
