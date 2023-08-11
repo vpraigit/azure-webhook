@@ -1,100 +1,29 @@
 import azure.functions as func
-from azure.mgmt.sql import SqlManagementClient
-from azure.identity import ClientSecretCredential
-from azure.mgmt.resource import ResourceManagementClient
-from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
-from azure.mgmt.web import WebSiteManagementClient
-import json
-import os
-
-import requests
 import logging
+from azure.identity import ClientSecretCredential, DefaultAzureCredential
+from azure.mgmt.sql import SqlManagementClient
+from azure.mgmt.compute import ComputeManagementClient
+from azure.mgmt.network import NetworkManagementClient
+from azure.identity import ClientSecretCredential
+
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
+import os
+import logging
+import requests
+import winrm
 
-def failover(rec_res_group_name,app_service_name,web_client,resource_client,client, resource_group_name,locations,recovery_region,rec_id):
-    server=client.servers.list_by_resource_group(resource_group_name)
-    # logging.info(server)
-    server_list=[]
-    for i in server:
-        server_list.append(i.name)
-    logging.info(server_list)
-    if len(server_list) == 0:
-        logging.info("404 : No Server found")
-        exit()
-    def update_conn_string(setting_name, new_setting_value):
-        app_settings = web_client.web_apps.list_application_settings(rec_res_group_name, app_service_name)
-
-        app_settings.properties[setting_name] = new_setting_value
-
-        web_client.web_apps.update_application_settings(rec_res_group_name, app_service_name,app_settings)
-
-        logging.info(f"Updated the application setting '{setting_name}' with the value '{new_setting_value}'.")
-    def store_json_in_existing_container(json_data, container_name, file_name, connection_string):
-        try:
-            # Create a BlobServiceClient using the connection string
-            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-
-            # Get the container client
-            container_client = blob_service_client.get_container_client(container_name)
-
-            # Convert JSON data to bytes
-            json_bytes = json.dumps(json_data).encode('utf-8')
-
-            # Create a blob client
-            blob_client = container_client.get_blob_client(file_name)
-
-            # Upload the JSON data to the blob
-            blob_client.upload_blob(json_bytes, overwrite=True)
-
-            logging.info(f"JSON file '{file_name}' uploaded successfully to container '{container_name}'.")
-        except Exception as e:
-            logging.info(f"Error uploading JSON file: {str(e)}")
-    def partner_server_rg(sql_server_name):
-        for resource in resource_client.resources.list(filter=f"resourceType eq 'Microsoft.Sql/servers' and name eq '{sql_server_name}'"):
-            server_resource_group = resource.id.split('/')[4]  # Extract resource group name from resource ID
-            break
-        return server_resource_group
-    def make_fail_over(resource_group_name,server_name, database_name, recovery_region):
-        primary=client.replication_links.list_by_database(resource_group_name, server_name, database_name)
-        database_link_id = None
-        replica_server = None
-        for l in primary:
-            # logging.info(l)
-            database_link_id = l.name
-            replica_server = l.partner_server
-            
-            # logging.info(l.partner_location.replace(" ", "").lower(), recovery_region)
-            if l.partner_location.replace(" ", "").lower() == recovery_region.replace(" ", "").lower() and l.partner_role == "Secondary":
-                replica_server_rg = partner_server_rg(replica_server)
-                operation = client.replication_links.begin_failover(replica_server_rg, replica_server, database_name,database_link_id)
-                source = {
-                "resource_grp_name" : resource_group_name,
-                "server_name_pri" : server_name,
-                "database_name_pri" : database_name,
-                "link_id"  : database_link_id
-            }
-    for i in server_list:
-        database_a=client.databases.list_by_server(resource_group_name,i)
-        for j in database_a:
-            if j.location==locations:
-                if j.name != "master" and j.secondary_type == None:
-                    # logging.info(i,j.name, recovery_region)
-                    make_fail_over(resource_group_name,i,j.name, recovery_region)
-    logging.info("End Of Function")
-
+logging.basicConfig(level=logging.INFO)
 
 @app.function_name(name="HttpTrigger")
 @app.route(route="", auth_level=func.AuthLevel.ANONYMOUS)
 def HttpTrigger(req: func.HttpRequest) -> func.HttpResponse:
     try:
         logging.info('Python HTTP trigger function processed a request.')
-        request_json = req.get_json()
-        logging.info(request_json)
-        deployment_name = request_json['recoveryName']
+        request_json=req.get_json()
+        deployment_name=request_json['recoveryName']
         primary_resource_metadata_url = request_json['resourceMapping']['primaryResourceMetadataPath']
         recovered_metadata_url = request_json['resourceMapping']['recoveredMetadataPath']
-        rec_id = request_json['recoveryId']
         # source_recovery_mapping_url = request_json['resourceMapping']['sourceRecoveryMappingPath']
 
         # Send GET requests and print the JSON responses
@@ -111,7 +40,7 @@ def HttpTrigger(req: func.HttpRequest) -> func.HttpResponse:
                         "/")[2]
                     break
 
-        # Send GET requests and print the JSON responses
+      # Send GET requests and print the JSON responses
         json2 = requests.get(primary_resource_metadata_url).json()
         logging.info(json1)
 
@@ -122,21 +51,16 @@ def HttpTrigger(req: func.HttpRequest) -> func.HttpResponse:
                     location = item_data['region'].replace(' ', '').lower()
                     # recovery_subscription_id = item_data['cloudResourceReferenceId'].split("/")[2]
                     break
-        app_service_name = None
-        for item in json2:
-            if 'APP_SERVICE' in item:
-                app_service_name = deployment_name+"-"+item['APP_SERVICE'][0]['name']
-                break
-        rec_res_group_name = None
+
         for item in json2:
             if 'RESOURCE_GROUP' in item:
-                rec_res_group_name = deployment_name+"-"+item['RESOURCE_GROUP'][0]['name']
+                recovery_resource_group = deployment_name+"-"+item['RESOURCE_GROUP'][0]['name']
                 break
 
         client_id = os.environ["CLIENT_ID"]
         client_secret = os.environ["CLIENT_SECRET"]
         tenant_id = os.environ["TENANT_ID"]
-
+        
         # Create a client secret credential object
         credential = ClientSecretCredential(
             client_id=client_id,
@@ -144,15 +68,99 @@ def HttpTrigger(req: func.HttpRequest) -> func.HttpResponse:
             tenant_id=tenant_id
         )
 
-        client = SqlManagementClient(credential, subscription_id)
-        resource_client = ResourceManagementClient(credential, subscription_id)
-        web_client = WebSiteManagementClient(credential, subscription_id)
-        failover(rec_res_group_name,app_service_name,web_client,resource_client ,client, resource_group_name, location, recovery_region,rec_id)
+        # Create an instance of the SQL management client
+        sql_client = SqlManagementClient(credential, subscription_id)
 
-        return func.HttpResponse(
-            "200",
-            status_code=200)
+        # List all Microsoft SQL servers in the recovery resource group
+        servers = sql_client.servers.list_by_resource_group(resource_group_name)
+        # print(f"Listing all Microsoft SQL servers in the recovery resource group '{resource_group_name}'")
 
+        # Iterate over each server
+        for server in servers:
+            if server.location==location:
+                # print(f"Checking server '{server.name}' for read replicas")
+                # List the read replicas for the server
+                replicas = sql_client.replication_links.list_by_server(resource_group_name, server.name)
+                
+                # Iterate over each replica
+                for replica in replicas:
+                    # print(f"Checking replica '{replica.partner_server}' located in '{replica.partner_location}'")
+                    # print(replica.partner_location)
+                    # Check if the replica is located in the recovery region
+                    if replica.partner_location.replace(' ','').lower() == recovery_region:
+                        # print(f"Promoting replica '{replica.partner_server}' to become the primary server")
+                        
+                        # Promote the replica to become the primary server
+                        sql_client.replication_links.begin_failover(
+                            resource_group_name,
+                            replica.partner_server,
+                            replica.partner_database,
+                            replica.name
+                        )  
+                        server_name=server.name
+                        replica_name=replica.partner_server
+
+                        # Create clients for Compute and Network management
+                        compute_client = ComputeManagementClient(credential, subscription_id)
+                        network_client = NetworkManagementClient(credential, subscription_id)
+
+                        # Get all virtual machines in the resource group
+                        vms = compute_client.virtual_machines.list(recovery_resource_group)
+
+                        # Iterate over each virtual machine and get its public IP address
+                        for vm in vms:
+                            # Get the network interface for the VM
+                            nic_id = vm.network_profile.network_interfaces[0].id
+                            nic_name = nic_id.split('/')[-1]
+                            nic = network_client.network_interfaces.get(recovery_resource_group, nic_name)
+
+                            # Get the public IP address for the network interface
+                            if nic.ip_configurations[0].public_ip_address:
+                                public_ip_id = nic.ip_configurations[0].public_ip_address.id
+                                public_ip_name = public_ip_id.split('/')[-1]
+                                public_ip_address = network_client.public_ip_addresses.get(recovery_resource_group, public_ip_name)
+                                
+                                
+
+                                host = str(public_ip_address.ip_address)
+                                user = os.environ["USER"]
+                                password = os.environ["PASSWORD"]
+
+                                try:
+                                    session = winrm.Session(host, auth=(user, password), transport='ntlm')
+
+                                    file_path = os.environ["FILE_PATH"]
+
+                                    cmd = f'if exist "{file_path}" (echo true) else (echo false)'
+                                    result = session.run_cmd(cmd)
+
+                                    if result.std_out.strip() == b'true':
+                                        cmd = f'Get-Content -Path "{file_path}"'
+                                        result = session.run_ps(cmd)
+                                        file_contents = result.std_out.decode('utf-8')
+
+                                        file_contents = file_contents.replace(server_name, replica_name)
+
+                                        cmd = f'Set-Content -Path "{file_path}" -Value @"\n{file_contents}\n"@'
+                                        session.run_ps(cmd)
+                                        cmd = f'Restart-WebAppPool -Name "APPRANIX_myclouditecplatformapi.ciodev.accenture.com"'
+                                        session.run_ps(cmd)
+
+                                        print('File Updated')
+                                        return func.HttpResponse(
+                                            "200",
+                                            status_code=200)
+                                    else:
+                                        print('File does not exist or access denied')
+                                        logging.error(f"File does not exist or access denied")
+
+                                except Exception as e:
+                                    print(f'An error occurred: {str(e)}')
+                                    return func.HttpResponse(f"Error occurred: {str(e)}\n. This HTTP triggered function executed successfully.",status_code=400)
+                                
     except Exception as e:
         logging.error(f"Error occurred: {str(e)}")
-        return func.HttpResponse(f"Hello, {str(e)}. This HTTP triggered function executed successfully.", status_code=400)
+        return func.HttpResponse(f"Error occurred: {str(e)}\n. This HTTP triggered function executed successfully.",status_code=400)
+    return func.HttpResponse(
+                    "200",
+                    status_code=200)
