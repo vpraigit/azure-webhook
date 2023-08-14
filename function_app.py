@@ -1,5 +1,10 @@
 import azure.functions as func
 import logging
+import os
+import logging
+import requests
+import winrm
+import re
 from azure.identity import ClientSecretCredential, DefaultAzureCredential
 from azure.mgmt.sql import SqlManagementClient
 from azure.mgmt.compute import ComputeManagementClient
@@ -8,27 +13,21 @@ from azure.identity import ClientSecretCredential
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
-import os
-import logging
-import requests
-import winrm
+logging.basicConfig(level=logging.WARNING)
 
-logging.basicConfig(level=logging.INFO)
-
-@app.function_name(name="HttpTrigger")
-@app.route(route="", auth_level=func.AuthLevel.ANONYMOUS)
+@app.route(route="HttpTrigger", auth_level=func.AuthLevel.ANONYMOUS)
 def HttpTrigger(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        logging.info('Python HTTP trigger function processed a request.')
+        logging.warning('Python HTTP trigger function processed a request.')
         request_json=req.get_json()
         deployment_name=request_json['recoveryName']
         primary_resource_metadata_url = request_json['resourceMapping']['primaryResourceMetadataPath']
         recovered_metadata_url = request_json['resourceMapping']['recoveredMetadataPath']
         # source_recovery_mapping_url = request_json['resourceMapping']['sourceRecoveryMappingPath']
-
+        logging.warning(request_json)
         # Send GET requests and print the JSON responses
         json1 = requests.get(recovered_metadata_url).json()
-        logging.info(json1)
+        logging.warning(json1)
 
         for item in json1:
             for key, value in item.items():
@@ -42,20 +41,16 @@ def HttpTrigger(req: func.HttpRequest) -> func.HttpResponse:
 
       # Send GET requests and print the JSON responses
         json2 = requests.get(primary_resource_metadata_url).json()
-        logging.info(json1)
+        logging.warning(json2)
 
         for item in json2:
             for key, value in item.items():
                 for item_data in value:
                     resource_group_name = item_data['groupIdentifier']
+                    recovery_resource_group = deployment_name+"-"+resource_group_name
                     location = item_data['region'].replace(' ', '').lower()
                     # recovery_subscription_id = item_data['cloudResourceReferenceId'].split("/")[2]
                     break
-
-        for item in json2:
-            if 'RESOURCE_GROUP' in item:
-                recovery_resource_group = deployment_name+"-"+item['RESOURCE_GROUP'][0]['name']
-                break
 
         client_id = os.environ["CLIENT_ID"]
         client_secret = os.environ["CLIENT_SECRET"]
@@ -70,25 +65,34 @@ def HttpTrigger(req: func.HttpRequest) -> func.HttpResponse:
 
         # Create an instance of the SQL management client
         sql_client = SqlManagementClient(credential, subscription_id)
+        # Create clients for Compute and Network management
+        compute_client = ComputeManagementClient(credential, subscription_id)
+        network_client = NetworkManagementClient(credential, subscription_id)
 
         # List all Microsoft SQL servers in the recovery resource group
         servers = sql_client.servers.list_by_resource_group(resource_group_name)
-        # print(f"Listing all Microsoft SQL servers in the recovery resource group '{resource_group_name}'")
+        logging.warning(f"Listing all Microsoft SQL servers in the recovery resource group '{resource_group_name}'")
+        
+        resetsql=False
+        if "resetUser" in request_json:
+            location,recovery_region=recovery_region,location
+            resetsql=True
+            logging.warning("Reset")
 
+        sql_dict={}
         # Iterate over each server
         for server in servers:
             if server.location==location:
-                # print(f"Checking server '{server.name}' for read replicas")
+                logging.warning(f"Checking server '{server.name}' for read replicas")
                 # List the read replicas for the server
                 replicas = sql_client.replication_links.list_by_server(resource_group_name, server.name)
                 
                 # Iterate over each replica
                 for replica in replicas:
-                    # print(f"Checking replica '{replica.partner_server}' located in '{replica.partner_location}'")
-                    # print(replica.partner_location)
+                    logging.warning(f"Checking replica '{replica.partner_server}' located in '{replica.partner_location}'")
                     # Check if the replica is located in the recovery region
                     if replica.partner_location.replace(' ','').lower() == recovery_region:
-                        # print(f"Promoting replica '{replica.partner_server}' to become the primary server")
+                        logging.warning(f"Promoting replica '{replica.partner_server}' to become the primary server")
                         
                         # Promote the replica to become the primary server
                         sql_client.replication_links.begin_failover(
@@ -97,68 +101,149 @@ def HttpTrigger(req: func.HttpRequest) -> func.HttpResponse:
                             replica.partner_database,
                             replica.name
                         )  
-                        server_name=server.name
-                        replica_name=replica.partner_server
+                    sql_dict[server.name] = replica.partner_server
 
-                        # Create clients for Compute and Network management
-                        compute_client = ComputeManagementClient(credential, subscription_id)
-                        network_client = NetworkManagementClient(credential, subscription_id)
+                    logging.warning(f"Promoted replica '{replica.partner_server}' of server '{server.name}' to become the primary server")
+                else:
+                    logging.warning(f"Replica '{replica.partner_server}' of server '{server.name}' is not located in the recovery region")
+        else:
+            logging.warning(f"Server '{server.name}' is not located in the source region")
 
-                        # Get all virtual machines in the resource group
-                        vms = compute_client.virtual_machines.list(recovery_resource_group)
+        if resetsql:
+            return func.HttpResponse(
+                    "200",
+                    status_code=200)
 
-                        # Iterate over each virtual machine and get its public IP address
-                        for vm in vms:
-                            # Get the network interface for the VM
-                            nic_id = vm.network_profile.network_interfaces[0].id
-                            nic_name = nic_id.split('/')[-1]
-                            nic = network_client.network_interfaces.get(recovery_resource_group, nic_name)
+        logging.warning(f"Promoted Servers With Replica {sql_dict}")
 
-                            # Get the public IP address for the network interface
-                            if nic.ip_configurations[0].public_ip_address:
-                                public_ip_id = nic.ip_configurations[0].public_ip_address.id
-                                public_ip_name = public_ip_id.split('/')[-1]
-                                public_ip_address = network_client.public_ip_addresses.get(recovery_resource_group, public_ip_name)
-                                
-                                
+        logging.warning('Changing DB String In App VM')
+        # Iterate over each virtual machine and get its public IP address
+        pattern = re.compile(r".*App\d+.*")
 
-                                host = str(public_ip_address.ip_address)
-                                user = os.environ["USER"]
-                                password = os.environ["PASSWORD"]
+        for category in json1:
+            for resource_type, resources in category.items():
+                if resource_type == "PUBLIC_IP_ADDRESS":
+                    for resource in resources:
+                        name = resource["name"]
+                        match = pattern.match(name)
+                        if match:
+                            public_ip_id = resource['cloudResourceReferenceId']
+                            public_ip_name = public_ip_id.split('/')[-1]
+                            public_ip_address = network_client.public_ip_addresses.get(recovery_resource_group, public_ip_name)
+                            
+                            logging.warning(f"Logging in {public_ip_name.split('-')[0]} using {public_ip_address.ip_address}")
+                            
+                            host = str(public_ip_address.ip_address)
+                            user = os.environ["USER"]
+                            password = os.environ["PASSWORD"]
 
-                                try:
-                                    session = winrm.Session(host, auth=(user, password), transport='ntlm')
+                            try:
+                                session = winrm.Session(host, auth=(user, password), transport='ntlm')
 
-                                    file_path = os.environ["FILE_PATH"]
+                                file_path = os.environ["FILE_PATH"]
 
-                                    cmd = f'if exist "{file_path}" (echo true) else (echo false)'
-                                    result = session.run_cmd(cmd)
+                                cmd = f'if exist "{file_path}" (echo true) else (echo false)'
+                                result = session.run_cmd(cmd)
 
-                                    if result.std_out.strip() == b'true':
-                                        cmd = f'Get-Content -Path "{file_path}"'
-                                        result = session.run_ps(cmd)
-                                        file_contents = result.std_out.decode('utf-8')
+                                if result.std_out.strip() == b'true':
 
-                                        file_contents = file_contents.replace(server_name, replica_name)
+                                    cmd = f'Get-Content -Path "{file_path}"'
+                                    result = session.run_ps(cmd)
+                                    file_contents = result.std_out.decode('utf-8')
+                                    logging.warning(f"File contents : {file_contents}")
 
-                                        cmd = f'Set-Content -Path "{file_path}" -Value @"\n{file_contents}\n"@'
-                                        session.run_ps(cmd)
-                                        
-                                        cmd = f'Restart-WebAppPool -Name "APPRANIX_myclouditecplatformapi.ciodev.accenture.com"'
-                                        session.run_ps(cmd)
+                                    for key,value in sql_dict.items():
+                                        file_contents = file_contents.replace(key, value)
+                                    logging.warning(f"File contents : {file_contents}")
+                                    cmd = f'Set-Content -Path "{file_path}" -Value @"\n{file_contents}\n"@'
+                                    session.run_ps(cmd)
+                                    cmd = f'Restart-WebAppPool -Name "APPRANIX_myclouditecplatformapi.ciodev.accenture.com"'
+                                    session.run_ps(cmd)
 
-                                        print('File Updated')
-                                        return func.HttpResponse(
-                                            "200",
-                                            status_code=200)
-                                    else:
-                                        print('File does not exist or access denied')
-                                        logging.error(f"File does not exist or access denied")
+                                    logging.warning('File Updated')
+                                else:
+                                    logging.warning('File does not exist or access denied')
+                            except Exception as e:
+                                logging.warning(f'An error occurred: {str(e)}')
+        
+        logging.warning('Changing App Public IP In Web')
+        # Initialize an empty dictionary to store the mappings
+        ip_mapping = {}
 
-                                except Exception as e:
-                                    print(f'An error occurred: {str(e)}')
-                                    return func.HttpResponse(f"Error occurred: {str(e)}\n. This HTTP triggered function executed successfully.",status_code=400)
-                                
+        # Regular expression pattern to match resource names
+        ip_pattern = re.compile(r'^(.*?)(Web)(\d+)-ip$')
+
+        # Loop through each item in the JSON data
+        for item in json1:
+            for resource_type, resources in item.items():
+                if resource_type == "PUBLIC_IP_ADDRESS":
+                    for resource in resources:
+                        ip_id = resource["cloudResourceReferenceId"]
+                        match = ip_pattern.match(ip_id)
+                        if match:
+                            prefix = match.group(1)
+                            web_app = match.group(2)
+                            number = match.group(3)
+                            
+                            public_ip_id = resource['cloudResourceReferenceId']
+                            public_ip_name = public_ip_id.split('/')[-1]
+                            web_ip = network_client.public_ip_addresses.get(recovery_resource_group, public_ip_name)
+
+                            app_id = f"{prefix}App{number}-ip" if web_app == "Web" else f"{prefix}Web{number}-ip"
+                            if ip_id != app_id and app_id not in ip_mapping.values():
+                                public_ip_name = app_id.split('/')[-1]
+                                app_ip = network_client.public_ip_addresses.get(recovery_resource_group, public_ip_name)
+                                ip_mapping[str(web_ip.ip_address)] = str(app_ip.ip_address)
+
+        # Print the generated IP mapping dictionary
+        logging.warning(f"IP Mapping {ip_mapping}")
+
+        for key,value in ip_mapping.items():
+            logging.warning(f"Logging in {key} to update with {value}")
+                        
+            host = str(key)
+            user = os.environ["USER"]
+            password = os.environ["PASSWORD"]
+
+            try:
+                session = winrm.Session(host, auth=(user, password), transport='ntlm')
+
+                file_path = os.environ["FILE_PATH2"]
+
+                cmd = f'if exist "{file_path}" (echo true) else (echo false)'
+                result = session.run_cmd(cmd)
+
+                if result.std_out.strip() == b'true':
+
+                    cmd = f'Get-Content -Path "{file_path}"'
+                    result = session.run_ps(cmd)
+                    file_contents = result.std_out.decode('utf-8')
+                    logging.warning(f"File contents : {file_contents}")
+
+                    # Define the regular expression pattern for an IP address
+                    pattern = r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'
+
+                    # Search for the IP address in the URL
+                    match = re.search(pattern, file_contents)
+                    if match:
+                        # Replace the IP address with the new IP address
+                        file_contents = re.sub(pattern, value, file_contents)
+                        logging.warning(f"File contents : {file_contents}")
+                    else:
+                        # If no IP address is found, print the original URL
+                        logging.warning(f"No IP Addres Found In The File Path")
+
+                    cmd = f'Set-Content -Path "{file_path}" -Value @"\n{file_contents}\n"@'
+                    session.run_ps(cmd)
+                    cmd = f'Restart-WebAppPool -Name "APPRANIX_myclouditecplatformapi.ciodev.accenture.com"'
+                    session.run_ps(cmd)
+
+                    logging.warning('File Updated')
+                else:
+                    logging.warning('File does not exist or access denied')
+            except Exception as e:
+                logging.warning(f'An error occurred: {str(e)}')
+
     except Exception as e:
         logging.error(f"Error occurred: {str(e)}")
         return func.HttpResponse(f"Error occurred: {str(e)}\n. This HTTP triggered function executed successfully.",status_code=400)
